@@ -1,0 +1,51 @@
+---
+title: "Boosted Tree"
+author: "Navin Lo"
+date: "2024-03-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+load("modeling-setup.rda")
+```
+
+```{r}
+team_bt = boost_tree(mtry = tune(), 
+                           trees = tune(), 
+                           learn_rate = tune()) %>%
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+team_bt_wf = workflow() %>% add_model(team_bt) %>% add_recipe(team_recipe)
+
+team_bt_grid = grid_regular(mtry(range = c(1, 19)), 
+                            trees(range = c(100, 800)),
+                            learn_rate(range = c(-10, -1)),
+                            levels = 5)
+```
+
+```{r}
+tune_team_bt = tune_grid(
+  team_bt_wf,
+  resamples = team_folds,
+  grid = team_bt_grid
+)
+```
+
+```{r}
+best_bt = select_best(tune_team_bt, metric = 'roc_auc')
+show_best(tune_team_bt, metric = 'roc_auc')
+final_bt = finalize_workflow(team_bt_wf, best_bt)
+final_bt = fit(final_bt, team_train)
+
+```
+
+
+```{r}
+save(tune_team_bt, best_bt, final_bt, file = "BoostedTree.rda")
+```
+

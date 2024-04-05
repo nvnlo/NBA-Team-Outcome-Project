@@ -1,0 +1,51 @@
+---
+title: "Neural Network"
+author: "Navin Lo"
+date: "2024-04-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+load("modeling-setup.rda")
+```
+
+```{r}
+nnet_mod = mlp(epochs = tune(), 
+               hidden_units = tune(), 
+               penalty = tune(), 
+               learn_rate = 0.1) %>% 
+               set_engine("brulee") %>%
+               set_mode("classification")
+
+nnet_wf = workflow() %>% add_recipe(team_recipe) %>% add_model(nnet_mod)
+
+nnet_grid = grid_regular(
+  epochs(range = c(200, 600)),
+  hidden_units(range = c(10, 50)),
+  penalty(range = c(.01, .1)),
+  levels = 5
+)
+```
+
+```{r}
+tune_nnet_grid = tune_grid(
+  object = nnet_wf,
+  resamples = team_folds,
+  grid = nnet_grid
+)
+```
+
+```{r}
+best_nn = select_best(tune_nnet_grid, metric = 'roc_auc')
+final_nn = finalize_workflow(nnet_wf, best_nn)
+final_nn = fit(final_nn, team_train)
+```
+
+```{r}
+save(tune_nnet_grid, best_nn, final_nn, file = "TeamNeuralNet.rda")
+```
+

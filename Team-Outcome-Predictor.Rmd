@@ -1,0 +1,849 @@
+---
+title: "Predicting NBA Team Season Success"
+author: "Navin Lo"
+date: "UCSB Winter 2024"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    toc_collapsed: false
+---
+
+![](LarryOB.webp){width=70% height=auto}
+
+# Introduction
+
+The goal of this project is to build machine learning models that will be able to predict an NBA team's success for a given season. We will be using data from Kaggle, more specifically the  [NBA Stats (1947-present)](https://www.kaggle.com/datasets/sumitrodatta/nba-aba-baa-stats) database, which was gathered from Basketball Reference by Sumitro Datta. The database contains 17 datasets, and for this project we will be utilizing a merge between "Team Summaries" and "Team Per 100 Poss."
+
+## Why is this model relevant?
+
+Before and during each NBA season, analysts are constantly asked the question, "Who are the favorites for this year? Who do you predict will win the championship?" Most of the time this question is answered by those analysts using a subjective opinion, but what if there was a way to quantify team success and be able to predict future teams based on the numbers? That is the question this project aims to solve.
+
+![](dubs2018ring.jpg){width=70% height=auto}
+
+## Project Roadmap
+
+Now that we have explained the background and significance of this project let's discuss how we are going to implement it and analyze its results. Our goal is to be able to classify teams into various tiers of season success, and I will go into more detail later on about what those tiers will be and what they represent. To do this, there will be an extensive data cleaning process to get the dataset in working order to run the models, then we will visualize the predictor variables and see how they affect the outcome classes. We will then run four models: K-Nearest Neighbors, Elastic Net Regression, a Boosted Tree, then a Random Forest. Depending on whichever model performs the best, we will then continue to explore it by running it through our testing data. Let's get to it!
+
+## Why per 100 possessions instead of per game data?
+
+Rather than per-game data, which was an option for this project, I chose to use per 100 possessions data because of the translatability between eras. I will be doing my predictions based on data dating back to the 1980s, a time period when basketball was played at a completely different pace. Using per 100 possessions data helps to standardize all of the metrics, giving a more accurate predictions. 
+
+Time to load in our libraries, each with a specific purpose, and that I left in the comments of the following code chunk. 
+
+```{r results=FALSE, message=FALSE, warning=FALSE}
+library(tidymodels) # for running our models
+library(tidyverse) # working with data frames
+library(pROC) # ROC AUC curves
+library(ROCR) # visualize scoring metrics
+library(dplyr) # basic r functions
+library(corrplot) # correlation matrices
+library(kknn) # k nearest neighbors
+library(yardstick) # confusion matrices
+library(themis) # balancing unbalanced data
+library(ranger) # random forest
+library(glmnet) # elastic net
+library(xgboost) # boosted tree
+library(vip) # variable importance
+library(ggplot2) # visualizing our data
+library(naniar) # missing values plot
+```
+
+# Exploratory Data Analysis
+
+## Loading In and Exploring Our Data
+
+```{r}
+team_data = read.csv("Team Data.csv") # loading in our data
+head(team_data) # getting an idea of what it looks like
+```
+
+## Cleaning our data
+
+Let's remove some unnecessary columns that do not help with our predictions. Columns like games played, minutes played, their arena and attendance are not important for this project, so they can be taken out. I will be removing the `playoffs` column as well, as it is still "FALSE" for every team this year because the playoffs have not begun yet, which can skew the data. 
+
+This dataset goes back to 1974 but there is some missing data from before 1980, so let's remove those older dates too. 
+
+```{r Subsetting}
+# removing unnecessary columns
+team = subset(team_data, select = -c(X, lg, g, playoffs, abbreviation, mp, pw, pl, arena, attend, attend_g))
+team = team %>% filter(season >= 1980) # using data only after 1980, so no missing data
+
+head(team) # previewing data again
+```
+
+Rather than using wins and losses in this, I'd like to consolidate them and create a column named `win_pct`, which is just the team's wins divided by total games played. 
+
+```{r Win-Percentage}
+# adding win pct column to aid in prediction
+team$win_pct = round(team$w / (team$w + team$l), digits = 3)
+team = team %>% relocate(win_pct, .before=fg_per_100_poss)
+head(team)
+```
+
+## Creating Our Outcome Variable
+
+This dataset does not have a designated response column, or outcome variable, so let's create that. To do that, I utilized the _Thinking Basketball Podcast_ system of creating tiers. They classify teams in 7 tiers:
+
+1. **Inner Circle Title Contenders**: 3 or 4 teams per season that have the best chance at winning a championship that year, the cream of the crop.
+2. **Dark Horse Title Contenders**: A handful of teams who are not in that elite tier of teams, but right outside looking in and are dangerous to make a run.
+3. **Dangerous Teams**: Teams that are not viewed as having a legitimate chance at winning a championship, but are secure in the playoffs and can make a run if the odds are in their favor.
+4. **Fringe Playoff Teams**: Teams that just barely get into the playoffs, usually teams that are eliminated in the first or second round.  
+5. **Play-In Teams**: Teams fighting for a spot in the playoffs, but are on the verge of even making it. The NBA created the play-in a few years ago, and this is a chance for a few more teams to be competitive every year.
+6. **Lottery Teams**: The lottery is a place for the teams not in the playoffs to secure high draft picks, and this is the tier for those teams.
+7. **Tanking**: Sometimes on purpose, sometimes not, these teams are the worst of the worst and seem to be purposely losing games to secure a higher chance to get the highest draft picks in the lottery.
+
+
+We will be utilizing the `n_rtg`, or net rating, column to create our response. Net rating is one of the better one-number metrics to quantify how good a team is in a given season, is calculated by this formula:
+
+Net Rating = Offensive Rating - Defensive Rating
+           = Team points scored per 100 poss - Team points allowed per 100 poss
+
+Although it is not perfect, it will give a great prediction for how well each team will perform. Let's take a look at the highest lowest net ratings to get a gauge of the range of values we're dealing with. 
+
+```{r}
+team = team %>% relocate(n_rtg, .before=fg_per_100_poss)
+
+team_copy = team # making a copy for sorted net ratings
+nrtg_sorted = team_copy[order(team_copy$n_rtg, decreasing = TRUE),] # cutoff points for each tier
+head(nrtg_sorted) # seeing top few net ratings
+tail(nrtg_sorted) # bottom few net ratings
+```
+
+To create tiers, I sorted my data frame in decreasing order of team performance, and based on how teams finished seasons I created cutoff points for each tier. 
+
+1. **Inner Circle**: Net rating greater than 7.2
+2. **Dark Horse**: Net rating between 5.8 and 7.2
+3. **Dangerous Team**: Net rating between 2 and 5.8
+4. **Fringe Playoff Team**: Net rating 0.6 and 2
+5. **Play-In**: Net rating between -0.2 and 2
+6. **Lottery**: Net rating between -6 and -0.2
+7. **Tanking**: Net rating less than -6
+
+In this code you will notice me keeping the tiers as numbers, and this just makes it smoother for the visualization coming soon. 
+
+```{r}
+team = team %>%
+  mutate(outcome = case_when(
+    n_rtg >= 7.2 ~ "1",
+    (n_rtg >= 5.8 & n_rtg < 7.2) ~ "2",
+    (n_rtg >= 2.5 & n_rtg < 5.8) ~ "3",
+    (n_rtg >= 0.6 & n_rtg < 2.5) ~ "4",
+    (n_rtg >= -2 & n_rtg < 0.6) ~ "5",
+    (n_rtg >= -6 & n_rtg < -2) ~ "6", 
+    n_rtg < -6 ~ "7",
+    TRUE ~ "Uncategorized"
+  ))
+
+team = team %>% relocate(outcome, .after=n_rtg)
+tail(team)
+```
+
+## Morphing Our Data
+
+Now that we've created our win percentage and outcome variables, we no longer want to include our net rating column, and now the win and loss column becomes irrelevant as well, because percentage matters more, especially in seasons where not all 82 games were played. 
+
+```{r}
+# create a new data frame without some more unnecessary columns that were used to create "team"
+team_stats = team
+team_stats = subset(team_stats, select = -c(n_rtg, w, l, age))
+team_stats
+
+team_stats$season = as.factor(team_stats$season)
+team_stats$team = as.factor(team_stats$team)
+team_stats$outcome = as.factor(team_stats$outcome)
+
+head(team_stats)
+```
+
+## Visual EDA
+
+Now that we've taken out data from before 1980, let's see if there is any missing data. Turns out, by getting rid of those older dates we got rid of all of the missing data!
+
+```{r}
+vis_miss(team) # no missing data!
+```
+
+
+### Correlation Matrices
+
+Our dataset currently has 42 columns, and excluding `team`, `season` and `outcome`, we have 39 predictors. However, for a smaller dataset that is too many, so we will visualize the correlation between some predictors and see if we can remove any. The method will be, if correlation between two predictors is over 0.75, I will choose one to remove due to the fact that two highly correlated predictors do not both need to be included. 
+
+```{r fig.height=9, fig.width=11}
+team_stats %>% # obvious that many observations are correlated with each other, have to remove many
+  select(where(is.numeric)) %>%
+  cor() %>%
+  corrplot(type = "lower", diag = FALSE)
+```
+
+Based on this matrix, we will remove the following columns:
+
+```{r}
+team_info = subset(team_stats, select = -c(x3pa_per_100_poss, x2p_per_100_poss, x2pa_per_100_poss, fta_per_100_poss, mov, srs, o_rtg, ft_per_100_poss, fta_per_100_poss, ts_percent, e_fg_percent, tov_percent, orb_percent, ft_fga, opp_e_fg_percent, opp_drb_percent, opp_ft_fga, x3p_ar, fg_per_100_poss, x2p_percent, opp_tov_percent))
+```
+
+Now let's take a look and see if all of our predictors follow are less than positive or negative 0.75. And as we see, now everything looks good! Some variables are still correlated with each other, which makes sense, but it is not to the point where we need to worry about them and remove them for too high of a correlation. 
+
+```{r fig.height=9, fig.width=11}
+team_info %>% # now no correlations over |0.75|
+  select(where(is.numeric)) %>%
+  cor() %>%
+  corrplot(type = "lower", diag = FALSE, addCoef.col = "black", number.cex = 0.6)
+```
+
+Now that we have trimmed down some of the extra data, we have the following predictors:
+
+If a predictor that has `_per_100_poss` in its name, it is signifying a stat per 100 possessions, which is rather self-explanatory but I thought I'd save the explanation on each individual metric in the list below.
+
+1. `win_pct`: Team's win percentage for the given regular season.
+
+2. `fga_per_100_poss`: Field goals attempted (everything excluding free throws)
+
+3. `fg_percent`: Field goal percentage
+
+4. `x3p_per_100_poss`: Three-pointers attempted
+
+5. `x3p_percent`: Three-point percentage
+
+6. `ft_percent`: Free throw percentage
+
+7. `orb_per_100_poss`: Number of Offensive rebounds
+
+8. `drb_per_100_poss`: Number of Defensive rebounds
+
+9. `trb_per_100_poss`: Total rebounds, surprisingly not highly correlated with the previous two
+
+10. `ast_per_100_poss`: Number of Assists
+
+11. `stl_per_100_poss`: Number of Steals
+
+12. `blk_per_100_poss`: Number of Blocks
+
+13. `tov_per_100_poss`: Number of Turnovers
+
+14. `pf_per_100_poss`: Number of fouls a team commits
+
+15. `pts_per_100_poss`: Amount of points the team scores
+
+16. `sos`: Strength of schedule, calculated by the win percentages of opponents
+
+17. `d_rtg`: Defensive rating, or the amount of points allowed per 100 poss (I'll specify here because it is a new stat)
+
+18. `pace`: Pace, or the reason for using per 100 possessions data, as pace is very variable between                 eras. It is calculated by the number of possessions that occur during a 48-minute game. 
+
+19. `f_tr`: Free throw rate, calculated as free throws attempted per field goal attempt. 
+
+
+Now that we are done cleaning up our dataset, let's start digging a little deeper and taking a look at how some of our predictor variables impact our outcome! I probably included more plots than necessary, but it was fascinating to see how everything interacts. 
+
+### Distribution by Tier
+
+```{r}
+team_info %>% # barplot showing distribution of each tier
+  ggplot(aes(x = outcome, fill = outcome)) +
+  geom_bar() + 
+  labs(x = "Team Outcome") + 
+  scale_fill_brewer(palette = "OrRd", direction = -1)
+```
+
+As expected there are far fewer of tiers 1 and 2 (inner circle and dark horse contenders), as those two groups are much more difficult to reach. The bulk of team outcomes fall between tiers 3 and 6. 
+
+
+### Field Goal Percentage
+
+```{r}
+team_info %>% 
+  ggplot(aes(fg_percent)) + 
+  geom_bar(aes(fill = outcome), width = 0.001) +
+  labs(x = "Field Goal Percentage") + 
+  scale_fill_brewer(palette = "OrRd", direction = -1)
+```
+
+Similar to many of the plots, field goal percentage and outcome seem to be heavily related, with most of the inner circle title contending teams being on the higher end of the spectrum. 
+
+
+### Win Percentage
+
+
+```{r}
+team_info %>%
+  ggplot(aes(win_pct)) + 
+  geom_bar(aes(fill = outcome), width = 0.01) +
+  labs(x = "Win Percentage") + 
+  scale_fill_brewer(palette = "OrRd", direction = -1)
+```
+
+The win percentage plot is not surprising as well, but it is the most resounding result of all plots. There is a clear separation between teams and their outcomes, and this does make sense because though this is a regular season dataset, regular season success is a strong indicator of how the team will do later on in the season. Sorry, 2007 Mavericks.
+
+
+### Offensive and Defensive Rating
+
+```{r}
+team_info %>%
+  ggplot(aes(x = pts_per_100_poss, y = d_rtg, color = outcome)) +
+  geom_point() + 
+  labs(x = "Points Per 100 Possessions (Off. Rating)", y = "Defensive Rating") + 
+  scale_color_brewer(palette = "OrRd", direction = -1)
+```
+
+Here I created a scatter plot that put `pts_per_100_poss`, or offensive rating on the x axis and defensive rating on the y axis. The bottom right of the graph is where all the elite teams are, and these teams all have elite offenses and defenses. However there are some outliers, for example there is a point on the far right that is fairly high up on the graph. This would be an example of a team with a historically great offense, but only an average defense. 
+
+After looking into the data, that point is actually the Boston Celtics of this year, who are on pace to become the greatest offense of all time. Their defense only looks mediocre on this graph, but they are actually the number 2 ranked defense, which just goes to show how much the game has changed over the years. Offenses are historically great compared to past eras, so the average defensive rating has gone up significantly. 
+
+
+### Pace
+
+```{r}
+team_info %>%
+  ggplot(aes(pace)) + 
+  geom_bar(aes(fill = outcome), width = 0.3) +
+  labs(x = "Pace") + 
+  scale_fill_brewer(palette = "OrRd", direction = -1)
+```
+
+Pace seems to be the most evenly distributed metric so far, one that isn't a pure giveaway as to its impact on the team's outcome. Perhaps, though, like I mentioned earlier, this could be something to do with the era they played in. Let's look into that a little more by analyzing adjusting for each season's pace. 
+
+
+```{r}
+team_info %>%
+  ggplot(aes(x = season, y = pace, color = outcome)) +
+  geom_point() + 
+  scale_color_brewer(palette = "OrRd", direction = -1) +
+  labs(x = "Season", y = "Pace") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+Surprisingly, there is no significant giveaway as to how much pace correlates to team winning. It is quite interesting to see how much the average pace of play has changed, with historic pace in the 80s then the game slowing down in the 90s and 00s, then coming back up today. 
+
+
+### 3-Point Volume and Efficiency
+
+```{r}
+team_info %>%
+  ggplot(aes(x = x3p_percent, y = x3p_per_100_poss, color = outcome)) +
+  geom_point() + 
+  labs(x = "3-Point Percentage", y = "3-Point Attempts Per 100") +
+  scale_color_brewer(palette = "OrRd", direction = -1)
+```
+
+Maybe it's recency bias, but I expected 3-point shooting to have much more of an impact on outcome than there seems to be here. Though there are many elite teams towards the higher ends of percentage, number of attempts does not seem to be as significant of an impact as I expected. How about if I put season on the x-axis and volume on the y?
+
+```{r}
+team_info %>%
+  ggplot(aes(x = season, y = x3p_per_100_poss, color = outcome)) +
+  geom_point() + 
+  scale_color_brewer(palette = "OrRd", direction = -1) +
+  labs(x = "Season", y = "3-Point Attempts Per 100") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+Well, it is clear that league-wide 3-point volume increased over the years, but there does not seem to be a clear indication of direct impact to increasing winning. 
+
+
+### Assist to Turnover Ratio
+
+Assist to turnover ratio is a widely used statistic, but it is mainly associated with players, not teams. It signifies how well a player, or in this case, team, is able to share the ball while not giving the opponent extra possessions. 
+
+```{r}
+team_info %>%
+  ggplot(aes(x = ast_per_100_poss, y = tov_per_100_poss, color = outcome)) +
+  geom_point() + 
+  labs(x = "Assists Per 100", y = "Turnovers Per 100") +
+  scale_color_brewer(palette = "OrRd", direction = -1)
+```
+
+From this graph it does look like the teams on the higher end of assists and lower end on turnovers are the better teams! No wonder every analyst mentions this ratio so often. 
+
+
+### Rebounding
+
+```{r}
+team_info %>%
+  ggplot(aes(x = drb_per_100_poss, y = orb_per_100_poss, color = outcome)) +
+  geom_point() + 
+  labs(x = "Defensive Rebounds Per 100", y = "Offensive Rebounds Per 100") +
+  scale_color_brewer(palette = "OrRd", direction = -1)
+```
+
+Before this project I would have expected offensive and defensive rebounding to be positively correlated, but that does not seem to be the case. However when it comes to the distribution of our response variable, outcome, in this scatter plot, there does not seem to be much association.
+
+
+### Strength of Schedule
+
+Strength of schedule is a metric that takes into account a team's opponent win percentage throughout a season. 
+
+```{r}
+team_info %>%
+  ggplot(aes(sos)) + 
+  geom_bar(aes(fill = outcome), width = 0.05) +
+  labs(x = "Strength of Schedule") + 
+  scale_fill_brewer(palette = "OrRd", direction = -1)
+```
+
+Another one I didn't expect. Intuitively it kind of makes sense, but I would have thought that strength of schedule did not matter very much in predicting a team's outcome, and that the elite teams would be able to beat any team on their schedule. While that is still true, this graph does seem to indicate that the weaker the opponents, the better the team outcome.
+
+
+### Committing and Drawing Fouls
+
+```{r}
+team_info %>%
+  ggplot(aes(x = f_tr, y = pf_per_100_poss, color = outcome)) +
+  geom_point() + 
+  labs(x = "Free Throw Rate", y = "Personal Fouls Per 100") +
+  scale_color_brewer(palette = "OrRd", direction = -1)
+```
+
+This distribution seems pretty evenly spread, and again, not one I really saw coming. Being able to draw fouls and prevent how many fouls you draw is a very important skill for most NBA teams, but apparently not important enough to have much of an impact on team success. However it does look slightly like there is some evidence that less fouls committed has an impact, but free throw rate not so much. 
+
+
+### Turnovers and Forced Turnovers
+
+```{r}
+team_info %>%
+  ggplot(aes(x = (stl_per_100_poss + blk_per_100_poss), y = tov_per_100_poss, color = outcome)) +
+  geom_point() + 
+  labs(x = "Steals + Blocks Per 100", y = "Turnovers Per 100") +
+  scale_color_brewer(palette = "OrRd", direction = -1)
+```
+
+Similarly to the assist-to-turnover ratio graph, the relationship between the number of turnovers committed and forced is another important one for team success. This graph reflects that, as teams on the bottom right seem to be in higher tiers of overall success. 
+
+# Setting up models
+
+Now that we have visualized all of our data, it is finally time to build our models and put them to the test. 
+
+## Splitting our data
+
+Before running any models, we need to randomly split our data into testing and training. I have a smaller data set, so I felt that a 75/25 split would be good. Of course, we are stratifying on our outcome variable, `outcome`. Setting a seed is important for us because it ensures that we get the same random set every time we run the models, thus standardizing the results.
+
+```{r}
+set.seed(421)
+
+team_split = team_info %>%
+  initial_split(prop = 0.75, strata = "outcome")
+
+team_train = training(team_split)
+team_test = testing(team_split)
+
+dim(team_train)
+dim(team_test)
+```
+
+
+## Building our recipe
+
+Building a recipe helps gather all of the predictors and response necessary to build the models, and put them in one place for future use. In this recipe I will be using all the predictors I listed earlier. Below you can see the full thing. 
+
+```{r}
+set.seed(421)
+
+team_recipe = recipe(outcome ~ win_pct + fga_per_100_poss + fg_percent + x3p_per_100_poss +                                   x3p_percent + ft_percent + orb_per_100_poss + drb_per_100_poss + trb_per_100_poss + ast_per_100_poss + stl_per_100_poss + blk_per_100_poss + tov_per_100_poss + pf_per_100_poss + pts_per_100_poss + sos + d_rtg + pace + f_tr, data = team_train) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_predictors())
+prep(team_recipe) %>% bake(team_train)
+```
+
+## K-Fold Cross Validation
+
+Due to the fact that our data is unbalanced, we will use stratified sampling on our response variable, `outcome`. 
+
+```{r}
+team_folds = vfold_cv(team_train, v = 10, strata = outcome) # 10-fold CV
+```
+
+I will be saving the data from my main file and running my models in separate .rmd files, then loading them back in to save time and avoiding running them multiple times. 
+
+```{r}
+save(team_folds, team_recipe, team_train, team_test, file = "modeling-setup.rda")
+```
+
+# Model Building
+
+The most important step of this project is building the models themselves. This step took the longest amount of time, as some of the models took up to 30 minutes to run, which is a small number compared to some of my peers, who had models with tens of thousands of observations compared to my measly one thousand. In the setting of a multiclass classification, the best metric to use was `roc_auc`, or the area under the receiver operating characteristic curve. In this case, a perfect model has a value of 1, so that is the goal with each model. I will be tuning and running 4 models: K-Nearest Neighbors, an Elastic Net Regression, a Boosted Tree, Random Forest and Neural Network. The steps for each model are very similar, and began with building the recipe and performing stratified sampling. Following that, the steps are:
+
+1. Setting up the model and clarifying its engine and mode, which in this case is classification.
+2. Creating a workflow, which will then take the recipe and model as its parameters.
+3. Set up a tuning grid for each parameter that we need to tune.
+4. Tune those models, which is what takes the longest out of any step.
+5. Selecting the best model using the `roc_auc` metric.
+6. Finalizing the models and workflows by running them through our training step.
+7. Saving the data in an RDA file and loading it back into this file for visualization and further      analysis. 
+
+# Results of the Models
+
+Now that we have tuned our grids, let's load them back into the main file and analyze their performance. 
+
+```{r}
+load("KNN.rda")
+load("TeamElasticNet.rda")
+load("TeamRandomForest.rda")
+load("BoostedTree.rda")
+load("TeamNeuralNet.rda")
+```
+
+## Autoplots
+
+Autoplots are a great way to visualize the performance of our models, and can help us choose which of our tuned parameters performed best. We will use the _autoplot_ function in R to visualize the metric, `roc_auc`. 
+
+### K-Nearest Neighbors Plot
+
+K-Nearest Neighbors is a model that classifies by data based on, well, its nearest neighbors. It seems excessive, but I ran it on neighbors between 1 and 100 and found which number of neighbors gave the best fit. 
+
+```{r}
+autoplot(team_knn_fit) + theme_minimal()
+```
+
+I then found that somewhere just under 40 neighbors was the best performing model, with a `roc_auc` just under 0.9. 
+
+
+### Elastic Net Regression Plot
+
+Elastic Net Regression is a model that finds a medium between lasso and ridge regression, two forms of regression that shrink parameters down. In this model there are two parameters that need to be tuned, `penalty` and `mixture`. 
+
+```{r}
+autoplot(tune_team_elastic) + theme_minimal()
+```
+
+The results of the best model were `penalty` = 0.01 and `mixture` = 0.778, and they gave a `roc_auc` over 0.95, which is very good. 
+
+### Random Forest Plot
+
+Random forests are models that are combinations of many smaller decision trees, and utilize random sampling to take different combinations of predictors to make predictions. In this model the parameters used are:
+
+1. `trees`: Number of trees used, I ran my model on anywhere between 100 and 800.
+2. `mtry`: Number of randomly sampled from predictors. My model had 19 predictors, so my range was 1 to 19. 
+3. `min_n`: Minimal node size, or the number of observations in each node of a tree. I chose values between 10 and 20. 
+
+```{r}
+autoplot(tune_team_rf) + theme_minimal()
+```
+
+The tree with `mtry` = 10, `trees` = 800 and `min_n` = 10 was the best model, with a `roc_auc_` value close to 0.96. 
+
+### Boosted Tree Plot
+
+Boosted trees are another way of combining the results of individual trees, however the mechanism is slightly different for a boosted tree. Instead of combining trees in parallel, boosted trees do their work sequentially, each tree learning from the last and eventually coming to the best model. The parameters for this are:
+
+1. `mtry`: Same as random forest. I chose 1 to 19 as my range.
+2. `trees`: Same as well. I chose 100 to 800 again. 
+3. `learn-rate`: How quick the model learns. I chose values between -10 and -1, and these are scaled as exponents of 10. So a value of -1 means 0.1, so on and so forth. 
+
+```{r}
+autoplot(tune_team_bt) + theme_minimal()
+```
+
+The best model was one with `mtry` = 5, `trees` = 100, and `learn_rate` = 0.1. 
+
+```{r}
+autoplot(tune_nnet_grid) + theme_minimal()
+```
+
+The neural network did not perform as well as some of the other models, with its best ROC AUC score being around 0.70.
+
+## Accuracy of Our Models
+
+In order to compare the performance of each model, I created a tibble that contained the ROC AUC scores of each, in order to get a clear visualization of how well each model did. 
+
+```{r}
+knn_roc_auc = augment(final_knn, new_data = team_train) %>%
+  roc_auc(outcome, .pred_1:.pred_7) %>%
+  select(.estimate)
+
+elastic_roc_auc = augment(final_elastic, new_data = team_train) %>%
+  roc_auc(outcome, .pred_1:.pred_7) %>%
+  select(.estimate)
+
+bt_roc_auc = augment(final_bt, new_data = team_train) %>%
+  roc_auc(outcome, .pred_1:.pred_7) %>%
+  select(.estimate)
+
+rf_roc_auc = augment(final_rf, new_data = team_train) %>%
+  roc_auc(outcome, .pred_1:.pred_7) %>%
+  select(.estimate)
+
+nn_roc_auc = rf_roc_auc = augment(final_nn, new_data = team_train) %>%
+  roc_auc(outcome, .pred_1:.pred_7) %>%
+  select(.estimate)
+
+roc_auc_values = c(knn_roc_auc$.estimate,
+                   elastic_roc_auc$.estimate,
+                   bt_roc_auc$.estimate,
+                   rf_roc_auc$.estimate,
+                   nn_roc_auc$.estimate)
+
+model_names = c("K-Nearest Neighbors",
+                "Elastic Net",
+                "Boosted Tree",
+                "Random Forest",
+                "Neural Network")
+```
+
+```{r}
+final_results = tibble(Model = model_names,
+                       ROC_AUC = roc_auc_values)
+
+final_results %>%
+  arrange(-roc_auc_values)
+```
+
+From the graphs it is clear that all models ran extremely well, with none having `roc_auc` values under 0.95! However the boosted tree did the best, and we will be using it going forward to run on our testing data and see how well it truly did. 
+
+# Results From the Best Model
+
+From the tibble above, it was clear that the boosted tree performed the best out of all models. Now, let's determine which model truly did the best and run it with our testing data.
+
+```{r}
+show_best(tune_team_bt, n = 1, metric = "roc_auc") %>%
+  select(-.estimator, .config)
+```
+
+### Congratulations Boosted Tree 46!
+
+Out of the hundreds of boosted tree models, the 25th tree performed the best. You can see its parameters above. 
+
+
+Now let's run our model on our testing data and see how well it performed. 
+
+```{r}
+final_bt_testing = augment(final_bt, team_test) %>%
+  select(outcome, starts_with(".pred"))
+
+roc_auc(final_bt_testing, truth = outcome, .pred_1:.pred_7)
+```
+
+Very good! A 0.95 `roc_auc` value on our testing data is a fantastic score, and a sign that our models did a great job predicting the outcome. 
+
+# Visualizing Model Performance
+
+Now that we've seen how well our model boosted tree model ran on both training and testing data, let's take a look at some graphs and visualizations to see more specifics about our performance. 
+
+### Variable Importance
+
+Let's see which predictors were most important in its performance. 
+
+```{r}
+final_bt %>% 
+  extract_fit_parsnip() %>% 
+  vip() + theme_minimal()
+```
+
+It seems that win percentage played a significant role in predicting our outcome variable, which makes sense because of how correlated win percentage and net rating are in predicting overall team success. The next highest importance predictors were `pts_per_100_poss`, or offensive rating, and defensive rating. These also made sense as net rating is calculated by using these two. 
+
+### ROC Curve
+
+Let's take a look at ROC curves for how well our model predicted each individual predictor. For reference, the perfect curve looks like a 90 degree angle. 
+
+```{r}
+final_bt_testing %>%
+  roc_curve(outcome, .pred_1:.pred_7) %>%
+  autoplot()
+```
+
+In our case the best prediction was tier 7, or tanking, and the worst was tier 4, or fringe playoff teams. 
+
+### Confusion Matrix
+
+A confusion matrix shows how well the model did in predicting each class, with one side being actual values and one side being predicted. 
+
+```{r}
+conf_mat(final_bt_testing, truth = outcome, .pred_class) %>%
+  autoplot(type = "heatmap")
+```
+
+As described by the ROC curves, the model was able to predict our tanking teams at a very high rate, but struggled a decent bit predicting fringe playoff teams placing many of those values a tier too high or low. 
+
+# Putting Our Model to the Test
+
+For this section of the project, I did not want to cherry-pick some of the easiest-to-predict teams of all time, those with the most extreme data points either high (2017 Warriors, 1996 Bulls), or low (2024 Wizards, 2012 Bobcats). So, to avoid this, I spun a wheel of NBA teams then ran a random number generator in order to make it completely random. I did this for two teams, then did it for another two teams who I thought might have a chance at not being predicted well due to outside factors. 
+
+To make these predictions, I created a 1x19 data frame containing each team's stats from that season and told my model to predict the outcome. Here are the results!
+
+### 2005 Detroit Pistons
+
+![](05pistons.webp){width=70% height=auto}
+
+Actual: Dangerous team (tier 3)
+
+```{r}
+team_info %>% filter(team == "Detroit Pistons", season == "2005")
+```
+
+The Pistons in 2005 performed much better than their numbers predicted them to be, ending up first in the Eastern conference and making it all the way to the NBA Finals before losing to the San Antonio Spurs. 
+
+Their actual value is tier 3, let's see what the model predicted. 
+
+```{r}
+pistons = data.frame(
+  win_pct = 0.659,
+  fga_per_100_poss = 88.6,
+  fg_percent = 0.444,
+  x3p_per_100_poss = 5,
+  x3p_percent = 0.345,
+  ft_percent = 0.739,
+  orb_per_100_poss = 14.5,
+  drb_per_100_poss = 34.6,
+  trb_per_100_poss = 49.1,
+  ast_per_100_poss = 24.7,
+  stl_per_100_poss = 7.9,
+  blk_per_100_poss = 6.9,
+  tov_per_100_poss = 15.6,
+  pf_per_100_poss = 22.6,
+  pts_per_100_poss = 105.6,
+  sos = -0.55,
+  d_rtg = 101.2,
+  pace = 87.2,
+  f_tr = 0.335
+)
+
+predict(final_bt, new_data = pistons, type = "class")
+```
+
+Nice! Our model got it correct. The Pistons that year were much more than dangerous, maybe they should have been placed in a higher tier than they were. 
+
+
+### 2000 Dallas Mavericks
+
+![](00mavs.jpg){width=70% height=auto}
+
+Actual: Play-in team (tier 5)
+
+
+```{r}
+team_info %>% filter(team == "Dallas Mavericks", season == "2000")
+```
+
+The Mavericks in 2000 were not a great team, despite having two young future Hall of Famers in Steve Nash and Dirk Nowitzki. They ended up going 40-42 and missed the playoffs entirely. However if the play-in existed during the time they would have been right there, which is where the numbers have them. Let's see what the model says. 
+
+```{r}
+mavs = data.frame(
+  win_pct = 0.488,
+  fga_per_100_poss = 90.3,
+  fg_percent = 0.453,
+  x3p_per_100_poss = 6.7,
+  x3p_percent = 0.391,
+  ft_percent = 0.804,
+  orb_per_100_poss = 11.9,
+  drb_per_100_poss = 31.3,
+  trb_per_100_poss = 43.3,
+  ast_per_100_poss = 23.2,
+  stl_per_100_poss = 7.6,
+  blk_per_100_poss = 5.3,
+  tov_per_100_poss = 14.4,
+  pf_per_100_poss = 22.7,
+  pts_per_100_poss = 106.6,
+  sos = 0.29,
+  d_rtg = 107.2,
+  pace = 94.9,
+  f_tr = 0.248
+)
+
+predict(final_bt, new_data = mavs, type = "class")
+```
+
+Another success! The model got this one right as well. 
+
+Now let's try two teams from this past season that either underperformed or overperformed their regular season data, which is all that I used for this data set. 
+
+### 2023 Miami Heat 
+
+![](2023heat.webp){width=70% height=auto}
+
+Actual: Play-in Team (tier 5)
+
+```{r}
+team_info %>% filter(team == "Miami Heat", season == "2023")
+```
+
+The 2023 Miami massively disappointed in the regular season, going from a team who finished as the 1 seed in 2022 to being the 7 seed going into the playoffs. Let's see what the model thinks about their regular season numbers.
+
+```{r}
+heat = data.frame(
+  win_pct = 0.537,
+  fga_per_100_poss = 88,
+  fg_percent = .46,
+  x3p_per_100_poss = 12.3,
+  x3p_percent = .344,
+  ft_percent = .831,
+  orb_per_100_poss = 10,
+  drb_per_100_poss = 31.9,
+  trb_per_100_poss = 41.9,
+  ast_per_100_poss = 24.6,
+  stl_per_100_poss = 8.2,
+  blk_per_100_poss = 3.1,
+  tov_per_100_poss = 13.9,
+  pf_per_100_poss = 19.1,
+  pts_per_100_poss = 113,
+  sos = .18,
+  d_rtg = 113.3,
+  pace = 96.3,
+  f_tr = .27
+)
+
+predict(final_bt, new_data = heat, type = "class")
+```
+
+Our model got it correct! However, because we are using regular season data, the model cannot account for the fact that Jimmy Butler turns into Prime Michael Jordan in the playoffs, and willed his team to the NBA Finals before losing to the Denver Nuggets in six games. 
+
+Let's take a look at one more interesting case from last season.
+
+### 2023 Milwaukee Bucks
+
+![](23bucks.jpeg){width=70% height=auto}
+
+Actual: Dangerous team (tier 3)
+
+```{r}
+team_info %>%filter( team == 'Milwaukee Bucks', season == "2023")
+```
+
+
+The Bucks in 2023 were the top seeded team in the Eastern Conference going into the playoffs, and were viewed by most as an inner-circle title contender who would walk to at least the Eastern Conference Finals.
+
+This could be a case where the data knows more than the analysts do, as it only has them as a team that could have possibly made a run than an actual contender. Let's see what our model says. 
+
+```{r}
+bucks = data.frame(
+  win_pct = 0.707,
+  fga_per_100_poss = 89.2,
+  fg_percent = 0.473,
+  x3p_per_100_poss = 14.7,
+  x3p_percent = 0.368,
+  ft_percent = 0.743,
+  orb_per_100_poss = 11,
+  drb_per_100_poss = 37,
+  trb_per_100_poss = 48,
+  ast_per_100_poss = 25.5,
+  stl_per_100_poss = 6.3,
+  blk_per_100_poss = 4.9,
+  tov_per_100_poss = 14.4,
+  pf_per_100_poss = 17.8,
+  pts_per_100_poss = 115.4,
+  sos = -0.02,
+  d_rtg = 111.9,
+  pace = 100.5,
+  f_tr = .248
+)
+```
+
+```{r}
+predict(final_bt, new_data = bucks, type = "class")
+```
+
+In this case, the model differed from our numbers and seems to be more in line with the analysts in the  Bucks being a contender.
+
+However, the Bucks infamously collapsed and lost in the first round to the aforementioned Miami Heat, so having some playoff data and full-season data would be better for this model's performance on teams in the full season. 
+
+
+# Conclusion
+
+Through the process of this project, with extensive research, model building and analysis, my finding is that the best model to determine team success in the NBA is a boosted tree. Though it was not perfect, it did a great job for the parameters it was given to be able to build a good baseline prediction.
+
+As possible improvements are concerned, I think the models ran fine, I just believe including some sort of playoff data will help improve the overall prediction. It is unfortunate that I had to remove the `playoffs` column from my data frame, as data from this season would be incorrect if I included it. Maybe I will revisit this project in the NBA offseason, after the dataset has been updated by the creator to include the rest of the playoffs. 
+
+I also experimented with the inclusion of `season` as a dummy variable, but that dropped many of my metrics down by at least 10 percent, so only running my models to include numeric data was the best option. 
+
+It will not be a part of this project, but I plan on remaking this entire project on Python, to try implementing a neural network and seeing how that compares to the boosted tree, as well as gain  more experience with Scikit-learn and its many capabilities. 
+
+Overall, this project was a great opportunity for me to build experience with building models and machine learning as a whole, and the freedom to choose my topic made me even more enthusiastic about the project! 

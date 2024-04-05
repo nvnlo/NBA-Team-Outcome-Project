@@ -1,0 +1,49 @@
+---
+title: "Elastic Net"
+author: "Navin Lo"
+date: "2024-03-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+load("modeling-setup.rda")
+```
+
+```{r}
+team_elastic =  multinom_reg(penalty = tune(),
+                              mixture = tune()) %>%
+                              set_mode('classification') %>%
+                              set_engine('glmnet')
+
+team_elastic_grid = grid_regular(penalty(range = c(0.01,3), trans = identity_trans()),
+                                    mixture(range = c(0,1)),
+                                    levels = 10)
+
+team_elastic_wflow = workflow() %>% add_model(team_elastic) %>% add_recipe(team_recipe)
+```
+
+```{r}
+tune_team_elastic = tune_grid(
+  team_elastic_wflow,
+  resamples = team_folds,
+  grid = team_elastic_grid
+)
+```
+
+```{r}
+best_elastic = select_best(tune_team_elastic, metric = 'roc_auc')
+show_best(tune_team_elastic, metric = 'roc_auc')
+final_elastic = finalize_workflow(team_elastic_wflow, best_elastic)
+final_elastic = fit(final_elastic, team_train)
+```
+
+
+```{r}
+save(tune_team_elastic, best_elastic, final_elastic, file = "TeamElasticNet.rda")
+```
+
+
