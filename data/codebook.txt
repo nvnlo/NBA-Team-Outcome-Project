@@ -1,0 +1,22 @@
+If there is a predictor that has `_per_100_poss`, it is signifying a stat per 100 possessions, which is rather self-explanatory but I thought I'd save the explanation on each individual metric.
+
+`win_pct`: Team's win percentage for the given regular season.
+`fga_per_100_poss`: Field goals attempted (everything excluding free throws)
+`fg_percent`: Field goal percentage
+`x3p_per_100_poss`: Three-pointers attempted
+`x3p_percent`: Three-point percentage
+`ft_percent`: Free throw percentage
+`orb_per_100_poss`: Number of Offensive rebounds
+`drb_per_100_poss`: Number of Defensive rebounds
+`trb_per_100_poss`: Total rebounds
+`ast_per_100_poss`: Number of Assists
+`stl_per_100_poss`: Number of Steals
+`blk_per_100_poss`: Number of Blocks
+`tov_per_100_poss`: Number of Turnovers
+`pf_per_100_poss`: Number of fouls a team commits
+`pts_per_100_poss`: Amount of points the team scores
+`sos`: Strength of schedule, calculated by the win percentages of opponents
+`d_rtg`: Defensive rating, or the amount of points allowed per 100 poss
+`pace`: Pace, or the reason for using per 100 possessions data, as pace is very variable between                 eras. It is calculated by the number of possessions that occur during a 48-minute game. 
+`f_tr`: Free throw rate, calculated as free throws attempted per field goal attempt.
+`outcome`: Outcome variable, 7 numbered tiers representing team success (1 highest, 7 lowest)
